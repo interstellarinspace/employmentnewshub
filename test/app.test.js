@@ -7,6 +7,7 @@ const path = require('node:path');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'site-test-'));
 process.env.DB_PATH = path.join(tmp, 'test.db');
 process.env.ADMIN_PASSWORD = 'secret-pass';
+process.env.SOURCE_HOST_GAP_MS = '0';
 
 const { createApp } = require('../server/app');
 require('../server/seed').seedIfEmpty();
@@ -121,4 +122,54 @@ test('email alerts: signup, matching, instant send, manage and unsubscribe', asy
   assert.ok(digest.posts >= 1);
   assert.ok(outbox.some((m) => m.to === 'daily@example.com' && /Karnataka Bank Clerk/.test(m.html)));
   mailer.captureOutbox(null);
+});
+
+test('auto-import: robots.txt, first-run baseline, new notices become drafts', async () => {
+  const http = require('node:http');
+  const importer = require('../server/importer');
+  const { sources, posts } = require('../server/db');
+  let notices = ['<li><a href="/n/1.pdf">Recruitment of 50 Clerk Posts 2026</a></li>', '<li><a href="/tender.pdf">Tender for printing notification</a></li>'];
+  const site = http.createServer((req, res) => {
+    if (req.url === '/robots.txt') return res.end('User-agent: *\nDisallow: /private\n');
+    if (req.url === '/news') return res.end(`<html><body><ul id="menu"><li><a href="/about">About us</a></li></ul><ul id="news">${notices.join('')}</ul></body></html>`);
+    if (req.url === '/feed.xml') { res.setHeader('Content-Type', 'application/rss+xml'); return res.end('<rss><channel><item><title>Admit Card for Constable Exam 2026</title><link>http://x.test/ac</link></item></channel></rss>'); }
+    res.end('<a href="/x">Recruitment notification hidden</a>');
+  }).listen(0);
+  const origin = `http://127.0.0.1:${site.address().port}`;
+  try {
+    // robots.txt is respected
+    const blockedId = sources.create({ name: 'Private', url: `${origin}/private`, kind: 'html', interval_minutes: 60, enabled: 1, auto_publish: 0 });
+    assert.equal((await importer.checkSource(sources.get(blockedId))).status, 'blocked');
+
+    // RSS preview
+    const feed = await importer.preview({ url: `${origin}/feed.xml`, kind: 'rss' });
+    assert.equal(feed.items[0].type, 'admit-card');
+
+    const id = sources.create({ name: 'Test Board', url: `${origin}/news`, kind: 'html', selector: '#news a', interval_minutes: 60, enabled: 1, auto_publish: 0, default_category: 'State Govt Jobs' });
+    const first = await importer.checkSource(sources.get(id));
+    assert.equal(first.status, 'ok');
+    assert.equal(first.found, 1, 'tender filtered out, menu not scanned');
+    assert.equal(first.created, 0, 'first run only remembers');
+
+    notices.unshift('<li><a href="/n/2.pdf">Result of Assistant Exam 2026</a></li>');
+    const second = await importer.checkSource(sources.get(id));
+    assert.equal(second.created, 1);
+    const draft = posts.list({ status: 'draft', q: 'Result of Assistant' }).rows[0];
+    assert.ok(draft, 'draft created');
+    assert.equal(draft.type, 'result');
+    assert.equal(draft.category, 'State Govt Jobs');
+    assert.equal(draft.links[0].url, `${origin}/n/2.pdf`);
+
+    // Third run finds nothing new
+    assert.equal((await importer.checkSource(sources.get(id))).created, 0);
+
+    // Admin can see sources and publish the draft
+    assert.equal((await fetch(base + '/admin/sources', { headers: { Cookie: cookie } })).status, 200);
+    assert.equal((await fetch(`${base}/admin/sources/${id}`, { headers: { Cookie: cookie } })).status, 200);
+    const pub = await fetch(`${base}/admin/posts/${draft.id}/publish`, { method: 'POST', redirect: 'manual', headers: { Cookie: cookie } });
+    assert.equal(pub.status, 303);
+    assert.equal(posts.get(draft.id).status, 'published');
+  } finally {
+    site.close();
+  }
 });

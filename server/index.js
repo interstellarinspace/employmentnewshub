@@ -4,7 +4,12 @@ const { db } = require('./db');
 
 if (config.seedSample) require('./seed').seedIfEmpty();
 
-require('./mailer').startScheduler();
+const mailer = require('./mailer');
+const importer = require('./importer');
+mailer.startScheduler();
+// Auto-published imports trigger instant email alerts, same as publishing by hand.
+importer.setOnPublished((id) => { if (config.instantAlerts) mailer.sendInstantForPost(id).catch((e) => console.error('[mail]', e.message)); });
+importer.startScheduler();
 
 const server = createApp().listen(config.port, () => {
   console.log(`${config.siteName} running on http://localhost:${config.port}`);

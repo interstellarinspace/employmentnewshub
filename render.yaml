@@ -31,6 +31,8 @@ services:
         value: Asia/Kolkata
       - key: DIGEST_HOUR
         value: "8"
+      - key: SOURCE_CHECKS
+        value: "true"
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT

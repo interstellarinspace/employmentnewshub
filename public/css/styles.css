@@ -194,3 +194,6 @@ legend { font-weight: 700; padding: 0 6px; }
 .stat-row { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .stat-row .card b { display: block; font-size: 2rem; background: linear-gradient(120deg, #7c3aed, #db2777); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .stat-row .card span { color: var(--muted); }
+
+.alert-info { background: color-mix(in srgb, var(--primary) 12%, transparent); color: var(--primary); }
+code { background: color-mix(in srgb, var(--primary) 10%, transparent); padding: 1px 5px; border-radius: 4px; font-size: .9em; }

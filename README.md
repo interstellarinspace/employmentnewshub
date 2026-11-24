@@ -25,6 +25,7 @@ The name is set with one setting (`SITE_NAME`), so you can change it anytime wit
 - Simple formatting: lines like `General: ₹500` become a table, lines starting with `- ` become a bullet list
 - Email alerts page: SMTP status, send a test email, send the daily digest now, recent sends
 - Re-send any post to instant subscribers from its edit page
+- **Auto-import**: watch official recruitment websites and turn new notices into drafts (see below)
 - View and export subscribers with their preferences (CSV), read contact messages
 
 **Tech**: Node.js 22, Express, SQLite (built into Node, no separate database server), Nodemailer, Docker.
@@ -57,6 +58,32 @@ Copy `.env.example` to `.env` and fill it in. The important ones:
 | `CONTACT_EMAIL` | Email shown on the contact and privacy pages |
 | `SEED_SAMPLE` | `false` to start with an empty site |
 | `TRUST_PROXY` | `true` when hosted behind Render, Railway, Nginx or Cloudflare |
+
+## Auto-import from official websites
+
+**Admin → Auto-import** watches official recruitment websites for new notices, so you don't have to check them by hand.
+
+1. Click **Add source**. Give it a name and paste the address of the page that lists notices (often "What's New",
+   "Latest News", "Recruitment" or "Notices"), or the site's RSS feed if it has one.
+2. Click **Test (preview only)** to see which links would be picked up. If it also picks up menu links, add a CSS selector
+   for the notice list (for example `#news a` or `table.notices a`), or add words to "Only keep" / "Skip".
+3. Choose the category and state for imported posts, how often to check (15 minutes to 24 hours), and save.
+
+How it behaves:
+- The first check remembers what's already on the page. After that, each new notice becomes a **draft post** with its title,
+  the official link (PDF or page), the organisation, a guessed type (job, result, admit card, answer key, syllabus, admission),
+  and the last date and number of posts when the title mentions them.
+- Drafts appear in **Posts** with a "waiting for review" banner. Add the details and click **Publish**. Publishing sends instant
+  email alerts as usual.
+- **Auto-publish** (per source, off by default) publishes new notices immediately and emails instant subscribers.
+- Each source shows its last check, status and a history of runs and errors. **Check now** runs it immediately.
+- It is polite: it obeys each site's `robots.txt`, identifies itself as `EmploymentNewsHubBot/1.0 (+your SITE_URL)`,
+  waits a few seconds between requests to the same site, and imports at most 25 notices per run.
+
+Only add **official** websites (commissions, boards, ministries, PSUs, banks, universities). Do not add other job-alert sites:
+their write-ups are copyrighted and their terms usually forbid copying.
+
+Turn the scheduler off with `SOURCE_CHECKS=false`.
 
 ## Email job alerts
 
@@ -135,6 +162,7 @@ server/
   validate.js       form validation
   auth.js           admin login sessions
   mailer.js         email alerts: matching, instant alerts, daily digest, scheduler
+  importer.js       auto-import from official websites (robots.txt, parsing, drafts, scheduler)
   seed.js           sample posts
 public/             CSS, JavaScript, favicon
 test/               automated tests

@@ -73,6 +73,44 @@ db.exec(`
     failed INTEGER NOT NULL DEFAULT 0, note TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'html',            -- html | rss
+    selector TEXT,                                -- CSS selector for links on html pages
+    include_keywords TEXT,                        -- comma list; empty = built-in defaults
+    exclude_keywords TEXT,
+    default_type TEXT,                            -- empty = guess from the title
+    default_category TEXT,
+    default_state TEXT,
+    auto_publish INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    interval_minutes INTEGER NOT NULL DEFAULT 60,
+    last_checked_at TEXT,
+    last_status TEXT,                             -- ok | error | blocked
+    last_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS source_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    post_id INTEGER,
+    baseline INTEGER NOT NULL DEFAULT 0,          -- 1 = existed at first check, no draft made
+    seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(source_id, url)
+  );
+  CREATE TABLE IF NOT EXISTS source_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    status TEXT NOT NULL, found INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL DEFAULT 0,
+    message TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
 // Backfill tokens / published_at for rows created before these columns existed.
 for (const r of db.prepare('SELECT id FROM subscribers WHERE token IS NULL').all()) {
   db.prepare('UPDATE subscribers SET token = ? WHERE id = ?').run(require('node:crypto').randomBytes(24).toString('base64url'), r.id);
@@ -122,6 +160,7 @@ const posts = {
     if (p.status === 'published') db.prepare("UPDATE posts SET published_at = COALESCE(published_at, datetime('now')) WHERE id = ?").run(id);
     return changes;
   },
+  publish: (id) => db.prepare("UPDATE posts SET status = 'published', published_at = COALESCE(published_at, datetime('now')), updated_at = datetime('now') WHERE id = ?").run(id).changes,
   markAlerted: (id) => db.prepare("UPDATE posts SET alerted_at = datetime('now') WHERE id = ?").run(id),
   publishedSince: (since) => db.prepare("SELECT * FROM posts WHERE status = 'published' AND published_at > ? ORDER BY published_at DESC LIMIT 200").all(since).map(hydrate),
   remove: (id) => db.prepare('DELETE FROM posts WHERE id = ?').run(id).changes,
@@ -213,4 +252,26 @@ const messages = {
   remove: (id) => db.prepare('DELETE FROM messages WHERE id = ?').run(id).changes,
 };
 
-module.exports = { db, posts, subscribers, messages, settings, emailLog };
+const SRC_FIELDS = ['name', 'url', 'kind', 'selector', 'include_keywords', 'exclude_keywords', 'default_type', 'default_category',
+  'default_state', 'auto_publish', 'enabled', 'interval_minutes'];
+const sources = {
+  list: () => db.prepare(`SELECT s.*, (SELECT COUNT(*) FROM source_items i WHERE i.source_id = s.id AND i.post_id IS NOT NULL) AS imported
+    FROM sources s ORDER BY s.name`).all(),
+  get: (id) => db.prepare('SELECT * FROM sources WHERE id = ?').get(id),
+  create: (d) => Number(db.prepare(`INSERT INTO sources (${SRC_FIELDS.join(',')}) VALUES (${SRC_FIELDS.map(() => '?').join(',')})`).run(...SRC_FIELDS.map((f) => d[f] ?? null)).lastInsertRowid),
+  update: (id, d) => db.prepare(`UPDATE sources SET ${SRC_FIELDS.map((f) => `${f} = ?`).join(', ')} WHERE id = ?`).run(...SRC_FIELDS.map((f) => d[f] ?? null), id),
+  remove: (id) => db.prepare('DELETE FROM sources WHERE id = ?').run(id),
+  due: () => db.prepare(`SELECT * FROM sources WHERE enabled = 1 AND (last_checked_at IS NULL
+    OR last_checked_at <= datetime('now', '-' || interval_minutes || ' minutes'))`).all(),
+  setResult: (id, status, message) => db.prepare("UPDATE sources SET last_checked_at = datetime('now'), last_status = ?, last_message = ? WHERE id = ?").run(status, message, id),
+  hasItems: (id) => !!db.prepare('SELECT 1 FROM source_items WHERE source_id = ? LIMIT 1').get(id),
+  seen: (id, url) => !!db.prepare('SELECT 1 FROM source_items WHERE source_id = ? AND url = ?').get(id, url),
+  addItem: (id, url, title, postId, baseline) => db.prepare('INSERT OR IGNORE INTO source_items (source_id, url, title, post_id, baseline) VALUES (?, ?, ?, ?, ?)').run(id, url, title, postId ?? null, baseline ? 1 : 0),
+  items: (id) => db.prepare(`SELECT i.*, p.status AS post_status, p.slug, p.type FROM source_items i LEFT JOIN posts p ON p.id = i.post_id
+    WHERE i.source_id = ? ORDER BY i.id DESC LIMIT 200`).all(id),
+  addRun: (r) => db.prepare('INSERT INTO source_runs (source_id, status, found, created, message) VALUES (?, ?, ?, ?, ?)').run(r.source_id, r.status, r.found || 0, r.created || 0, r.message || null),
+  runs: (id) => db.prepare('SELECT * FROM source_runs WHERE source_id = ? ORDER BY id DESC LIMIT 30').all(id),
+  pendingDrafts: () => db.prepare("SELECT COUNT(*) AS n FROM posts p JOIN source_items i ON i.post_id = p.id WHERE p.status = 'draft'").get().n,
+};
+
+module.exports = { db, posts, subscribers, messages, settings, emailLog, sources };

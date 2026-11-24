@@ -1,7 +1,9 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const config = require('./config');
-const { posts, subscribers, messages, emailLog, settings } = require('./db');
+const { posts, subscribers, messages, emailLog, settings, sources } = require('./db');
+const importer = require('./importer');
+const { STATES: ALL_STATES } = require('./taxonomy');
 const mailer = require('./mailer');
 const { TYPES, CATEGORIES, QUALIFICATIONS, STATES } = require('./taxonomy');
 const { validatePost, linksToText } = require('./validate');
@@ -21,7 +23,7 @@ function shell(title, body, { nav = true } = {}) {
 <link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/css/styles.css"><script src="/js/admin.js" defer></script></head>
 <body class="admin"><header class="site-header"><div class="container topbar">
 <a class="brand" href="/admin"><span class="brand-mark" aria-hidden="true">${esc(config.siteName[0] || "")}</span><span>${esc(config.siteName)} Admin</span></a>
-${nav ? `<nav class="admin-nav"><a href="/admin">Posts</a><a href="/admin/posts/new">+ New post</a><a href="/admin/subscribers">Subscribers</a><a href="/admin/email">Email alerts</a><a href="/admin/messages">Messages</a><a href="/" target="_blank">View site ↗</a>
+${nav ? `<nav class="admin-nav"><a href="/admin">Posts</a><a href="/admin/posts/new">+ New post</a><a href="/admin/sources">Auto-import</a><a href="/admin/subscribers">Subscribers</a><a href="/admin/email">Email alerts</a><a href="/admin/messages">Messages</a><a href="/" target="_blank">View site ↗</a>
 <form method="post" action="/admin/logout" style="display:inline"><button class="btn btn-outline btn-sm">Log out</button></form></nav>` : ''}
 </div></header><main class="container page">${body}</main></body></html>`;
 }
@@ -53,10 +55,12 @@ router.get('/', (req, res) => {
   const { total, rows } = posts.list({ type, status, q, limit: 50, offset: (page - 1) * 50 });
   const pages = Math.ceil(total / 50);
   const qs = (n) => esc(new URLSearchParams({ ...(type && { type }), ...(status && { status }), ...(q && { q }), page: n }).toString());
-  const flash = { saved: 'Post saved.', deleted: 'Post deleted.', alerted: 'Post saved. Instant email alerts are being sent to matching subscribers.' }[req.query.msg];
+  const flash = { saved: 'Post saved.', deleted: 'Post deleted.', alerted: 'Post saved. Instant email alerts are being sent to matching subscribers.', published: 'Post published.' }[req.query.msg];
+  const pending = sources.pendingDrafts();
   const body = html`
     <div class="toolbar"><h1>Posts <small class="muted">(${total})</small></h1><a class="btn btn-primary" href="/admin/posts/new">+ New post</a></div>
     ${flash ? html`<div class="alert alert-success show">${flash}</div>` : ''}
+    ${pending && status !== 'draft' ? html`<div class="alert alert-info show">${pending} auto-imported draft${pending > 1 ? 's are' : ' is'} waiting for review. <a href="/admin?status=draft">Review drafts →</a></div>` : ''}
     <form class="filters" method="get">
       <input type="search" name="q" value="${q}" placeholder="Search title or organisation">
       <select name="type">${raw('<option value="">All types</option>' + Object.entries(TYPES).map(([k, t]) => `<option value="${k}"${type === k ? ' selected' : ''}>${esc(t.label)}</option>`).join(''))}</select>
@@ -69,7 +73,7 @@ router.get('/', (req, res) => {
       <td>${TYPES[p.type]?.singular || p.type}</td>
       <td><span class="tag ${p.status === 'draft' ? 'tag-closed' : 'tag-ok'}">${p.status}</span></td>
       <td class="nowrap">${fmtDate(p.last_date)}</td><td>${p.views}</td>
-      <td class="nowrap"><a class="btn btn-outline btn-sm" href="/admin/posts/${p.id}/edit">Edit</a> ${p.status === 'published' ? html`<a class="btn btn-outline btn-sm" href="${postUrl(p)}" target="_blank">View</a>` : ''}</td>
+      <td class="nowrap"><a class="btn btn-outline btn-sm" href="/admin/posts/${p.id}/edit">Edit</a> ${p.status === 'draft' ? html`<form method="post" action="/admin/posts/${p.id}/publish" style="display:inline"><button class="btn btn-primary btn-sm">Publish</button></form>` : ''} ${p.status === 'published' ? html`<a class="btn btn-outline btn-sm" href="${postUrl(p)}" target="_blank">View</a>` : ''}</td>
     </tr>`) : raw('<tr><td colspan="6" class="muted">No posts yet. Click “New post” to add one.</td></tr>')}
     </tbody></table></div>
     ${pages > 1 ? raw(`<nav class="pagination">${Array.from({ length: pages }, (_, i) => i + 1).map((n) => (n === page ? `<span class="current">${n}</span>` : `<a href="?${qs(n)}">${n}</a>`)).join('')}</nav>`) : ''}`;
@@ -127,6 +131,12 @@ function maybeAlert(id) {
   mailer.sendInstantForPost(id).catch((e) => console.error('[mail]', e.message));
   return true;
 }
+
+router.post('/posts/:id/publish', (req, res, next) => {
+  const id = Number(req.params.id);
+  if (!posts.publish(id)) return next();
+  res.redirect(303, `/admin?status=draft&msg=${maybeAlert(id) ? 'alerted' : 'published'}`);
+});
 
 router.post('/posts/:id/notify', async (req, res, next) => {
   const id = Number(req.params.id);
@@ -220,6 +230,152 @@ router.post('/email/test', async (req, res) => {
 router.post('/email/digest', async (req, res) => {
   const r = await mailer.sendDailyDigest();
   res.redirect(303, `/admin/email?msg=${encodeURIComponent(r.posts ? `Digest sent to ${r.sent} subscriber(s) (${r.failed} failed), covering ${r.posts} new post(s).` : 'No new posts since the last digest, so nothing was sent.')}`);
+});
+
+// ----- Auto-import sources -----
+const STATUS_TAG = { ok: 'tag-ok', error: 'tag-closed', blocked: 'tag-soon' };
+function readSource(b = {}) {
+  const kw = (v) => String(v || '').split(',').map((x) => x.trim()).filter(Boolean).join(', ').slice(0, 500);
+  let url = String(b.url || '').trim().slice(0, 1000);
+  const errors = {};
+  try { const u = new URL(url); if (!/^https?:$/.test(u.protocol)) throw new Error(); } catch { errors.url = 'Enter a full web address starting with https://'; }
+  const name = String(b.name || '').trim().slice(0, 120);
+  if (name.length < 2) errors.name = 'Give this source a name, e.g. "Staff Selection Commission".';
+  return {
+    data: {
+      name, url, kind: b.kind === 'rss' ? 'rss' : 'html', selector: String(b.selector || '').trim().slice(0, 300) || null,
+      include_keywords: kw(b.include_keywords) || null, exclude_keywords: kw(b.exclude_keywords) || null,
+      default_type: TYPES[b.default_type] ? b.default_type : null,
+      default_category: CATEGORIES.includes(b.default_category) ? b.default_category : null,
+      default_state: ALL_STATES.includes(b.default_state) ? b.default_state : null,
+      auto_publish: b.auto_publish === 'on' ? 1 : 0, enabled: b.enabled === 'on' ? 1 : 0,
+      interval_minutes: Math.min(Math.max(parseInt(b.interval_minutes, 10) || 60, 15), 1440),
+    },
+    errors,
+  };
+}
+
+router.get('/sources', (req, res) => {
+  const list = sources.list();
+  res.send(shell('Auto-import', html`
+    <div class="toolbar"><h1>Auto-import from official websites</h1><a class="btn btn-primary" href="/admin/sources/new">+ Add source</a></div>
+    ${req.query.msg ? html`<div class="alert alert-success show">${req.query.msg}</div>` : ''}
+    <p class="muted">Add the "latest notifications" page or RSS feed of official recruitment websites. The site checks each one on a schedule and turns new notices into drafts for you to review (or publishes them directly if you turn on auto-publish). It follows each website's robots.txt rules and identifies itself as <code>${importer.USER_AGENT}</code>.</p>
+    <div class="table-wrap"><table class="table admin-table"><thead><tr><th>Source</th><th>Every</th><th>Last check</th><th>Status</th><th>Imported</th><th></th></tr></thead><tbody>
+    ${list.length ? list.map((s) => html`<tr>
+      <td><a href="/admin/sources/${s.id}"><b>${s.name}</b></a> ${s.enabled ? '' : raw('<span class="tag tag-closed">paused</span>')} ${s.auto_publish ? raw('<span class="tag tag-new">auto-publish</span>') : ''}<br><small class="muted">${s.url.length > 70 ? s.url.slice(0, 70) + '…' : s.url}</small></td>
+      <td class="nowrap">${s.interval_minutes} min</td>
+      <td class="nowrap">${s.last_checked_at ? html`${s.last_checked_at} UTC` : raw('<span class="muted">Not yet</span>')}</td>
+      <td>${s.last_status ? html`<span class="tag ${STATUS_TAG[s.last_status] || ''}">${s.last_status}</span><br><small class="muted">${s.last_message || ''}</small>` : ''}</td>
+      <td>${s.imported}</td>
+      <td class="nowrap"><form method="post" action="/admin/sources/${s.id}/check" style="display:inline"><button class="btn btn-outline btn-sm">Check now</button></form> <a class="btn btn-outline btn-sm" href="/admin/sources/${s.id}/edit">Edit</a></td>
+    </tr>`) : raw('<tr><td colspan="6" class="muted">No sources yet. Click “Add source” to add your first official website.</td></tr>')}
+    </tbody></table></div>
+    <div class="card" style="margin-top:16px"><h2>Tips</h2><ul>
+      <li>Use official websites only (commissions, boards, ministries, PSUs, banks, universities). Don't add other job-alert websites: their content is copyrighted and their terms usually forbid copying.</li>
+      <li>Point the source at the page that lists notices (often called "What's New", "Latest News", "Recruitment" or "Notices"). If the site has an RSS feed, use that.</li>
+      <li>Use <b>Test</b> on the form to see what would be picked up before saving. If it picks up menu links, add a CSS selector for the notice list, e.g. <code>#latest-news a</code> or <code>table.notices a</code>.</li>
+      <li>The first check only remembers what's already there. After that, only newly added notices become drafts.</li>
+    </ul></div>`.s));
+});
+
+function sourceForm(s, { errors = {}, previewResult } = {}) {
+  const isEdit = !!s.id;
+  const err = (f) => (errors[f] ? html`<div class="field-error">${errors[f]}</div>` : '');
+  return shell(isEdit ? 'Edit source' : 'Add source', html`
+    <div class="toolbar"><h1>${isEdit ? 'Edit source' : 'Add a source'}</h1>${isEdit ? html`<a class="btn btn-outline btn-sm" href="/admin/sources/${s.id}">View history</a>` : ''}</div>
+    ${Object.keys(errors).length ? raw('<div class="alert alert-error show">Please fix the highlighted fields.</div>') : ''}
+    ${previewResult ? previewResult : ''}
+    <form class="form card admin-form" method="post" action="${isEdit ? `/admin/sources/${s.id}` : '/admin/sources'}">
+      <div class="form-grid">
+        <div><label for="name">Name</label><input id="name" name="name" value="${s.name || ''}" placeholder="e.g. Staff Selection Commission" required>${err('name')}</div>
+        <div><label for="kind">Type</label><select id="kind" name="kind"><option value="html"${s.kind !== 'rss' ? raw(' selected') : ''}>Web page with a list of notices</option><option value="rss"${s.kind === 'rss' ? raw(' selected') : ''}>RSS / Atom feed</option></select></div>
+        <div class="span-2"><label for="url">Page or feed address</label><input id="url" name="url" value="${s.url || ''}" placeholder="https://www.example.gov.in/latest-notices" required>${err('url')}</div>
+        <div class="span-2"><label for="selector">CSS selector for the notice links (optional)</label><input id="selector" name="selector" value="${s.selector || ''}" placeholder="Leave empty to scan every link on the page, e.g. #news a"><small class="muted">Only for web pages. Narrows the scan to the part of the page that lists notices.</small></div>
+        <div><label for="include_keywords">Only keep links containing (optional)</label><input id="include_keywords" name="include_keywords" value="${s.include_keywords || ''}" placeholder="recruitment, result, admit card"><small class="muted">Comma separated. Empty uses built-in job words. Use * to keep everything.</small></div>
+        <div><label for="exclude_keywords">Skip links containing (optional)</label><input id="exclude_keywords" name="exclude_keywords" value="${s.exclude_keywords || ''}" placeholder="tender, corrigendum"></div>
+        <div><label for="default_type">Post type</label><select id="default_type" name="default_type">${raw('<option value="">Guess from the title</option>' + Object.entries(TYPES).map(([k, t]) => `<option value="${k}"${s.default_type === k ? ' selected' : ''}>${esc(t.singular)}</option>`).join(''))}</select></div>
+        <div><label for="interval_minutes">Check every (minutes)</label><input id="interval_minutes" name="interval_minutes" type="number" min="15" max="1440" value="${s.interval_minutes || 60}"></div>
+        <div><label for="default_category">Category for imported posts</label><select id="default_category" name="default_category">${options(CATEGORIES, s.default_category, '— None —')}</select></div>
+        <div><label for="default_state">State for imported posts</label><select id="default_state" name="default_state">${options(ALL_STATES, s.default_state, '— None —')}</select></div>
+        <div class="span-2"><label class="check"><input type="checkbox" name="enabled"${s.enabled !== 0 ? raw(' checked') : ''}> Check this source automatically</label></div>
+        <div class="span-2"><label class="check"><input type="checkbox" name="auto_publish"${s.auto_publish ? raw(' checked') : ''}> Auto-publish new notices (skips review and emails instant subscribers right away)</label>
+          <small class="muted">Recommended off: imported posts only have a title and link, so it's better to add dates, fees and eligibility first.</small></div>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit">${isEdit ? 'Save source' : 'Add source'}</button>
+        <button class="btn btn-outline" type="submit" formaction="/admin/sources/test">Test (preview only)</button>
+        <a class="btn btn-outline" href="/admin/sources">Cancel</a>
+      </div>
+      ${isEdit ? html`<input type="hidden" name="id" value="${s.id}">` : ''}
+    </form>
+    ${isEdit ? html`<form method="post" action="/admin/sources/${s.id}/delete" class="danger-zone" data-confirm="Delete this source? Posts already imported stay."><button class="btn btn-danger btn-sm">Delete source</button></form>` : ''}`.s);
+}
+
+router.get('/sources/new', (req, res) => res.send(sourceForm({ interval_minutes: 60, enabled: 1 })));
+router.post('/sources', (req, res) => {
+  const { data, errors } = readSource(req.body);
+  if (Object.keys(errors).length) return res.status(400).send(sourceForm(data, { errors }));
+  const id = sources.create(data);
+  // Run the first check right away so the user sees it working.
+  importer.checkSource(sources.get(id)).catch((e) => console.error('[sources]', e));
+  res.redirect(303, `/admin/sources?msg=${encodeURIComponent('Source added. The first check is running now.')}`);
+});
+router.post('/sources/test', async (req, res) => {
+  const { data, errors } = readSource(req.body);
+  const id = Number(req.body.id) || undefined;
+  if (Object.keys(errors).length) return res.status(400).send(sourceForm({ ...data, id }, { errors }));
+  let block;
+  try {
+    const r = await importer.preview(data);
+    block = html`<div class="card" style="margin-bottom:16px"><h2>Test result</h2>
+      <p>Found ${r.raw} link(s) on the page, <b>${r.items.length}</b> look like job notices${r.items.length > 50 ? ' (showing the first 50)' : ''}. Nothing was saved.</p>
+      ${r.items.length ? html`<div class="table-wrap"><table class="table"><thead><tr><th>Notice</th><th>Would be</th></tr></thead><tbody>${r.items.slice(0, 50).map((i) => html`<tr><td><a href="${i.url}" target="_blank" rel="noopener">${i.title}</a></td><td>${TYPES[i.type].singular}</td></tr>`)}</tbody></table></div>`
+        : raw('<p class="muted">Nothing matched. Try clearing the CSS selector, or set "Only keep links containing" to * to see every link.</p>')}</div>`;
+  } catch (e) {
+    block = html`<div class="alert alert-error show">Test failed: ${e.name === 'TimeoutError' ? 'the website took too long to respond.' : e.message}</div>`;
+  }
+  res.send(sourceForm({ ...data, id }, { previewResult: block }));
+});
+router.get('/sources/:id', (req, res, next) => {
+  const s = sources.get(Number(req.params.id));
+  if (!s) return next();
+  const items = sources.items(s.id), runs = sources.runs(s.id);
+  res.send(shell(s.name, html`
+    <div class="toolbar"><h1>${s.name}</h1><div><form method="post" action="/admin/sources/${s.id}/check" style="display:inline"><button class="btn btn-primary btn-sm">Check now</button></form> <a class="btn btn-outline btn-sm" href="/admin/sources/${s.id}/edit">Edit</a></div></div>
+    <p><a href="${s.url}" target="_blank" rel="noopener">${s.url}</a></p>
+    <h2>Recent checks</h2>
+    <div class="table-wrap"><table class="table"><thead><tr><th>When (UTC)</th><th>Status</th><th>Notices found</th><th>Imported</th><th>Message</th></tr></thead><tbody>
+    ${runs.length ? runs.map((r) => html`<tr><td class="nowrap">${r.created_at}</td><td><span class="tag ${STATUS_TAG[r.status] || ''}">${r.status}</span></td><td>${r.found}</td><td>${r.created}</td><td><small>${r.message || ''}</small></td></tr>`) : raw('<tr><td colspan="5" class="muted">Not checked yet.</td></tr>')}
+    </tbody></table></div>
+    <h2 style="margin-top:20px">Notices seen</h2>
+    <div class="table-wrap"><table class="table"><thead><tr><th>Notice</th><th>Post</th><th>Seen (UTC)</th></tr></thead><tbody>
+    ${items.length ? items.map((i) => html`<tr><td><a href="${i.url}" target="_blank" rel="noopener">${i.title}</a></td>
+      <td>${i.post_id ? (i.post_status ? html`<a href="/admin/posts/${i.post_id}/edit">${i.post_status}</a>` : 'deleted') : raw('<span class="muted">existing at first check</span>')}</td><td class="nowrap">${i.seen_at}</td></tr>`) : raw('<tr><td colspan="3" class="muted">None yet.</td></tr>')}
+    </tbody></table></div>`.s));
+});
+router.get('/sources/:id/edit', (req, res, next) => {
+  const s = sources.get(Number(req.params.id));
+  if (!s) return next();
+  res.send(sourceForm(s));
+});
+router.post('/sources/:id', (req, res, next) => {
+  const id = Number(req.params.id);
+  if (!sources.get(id)) return next();
+  const { data, errors } = readSource(req.body);
+  if (Object.keys(errors).length) return res.status(400).send(sourceForm({ ...data, id }, { errors }));
+  sources.update(id, data);
+  res.redirect(303, `/admin/sources?msg=${encodeURIComponent('Source saved.')}`);
+});
+router.post('/sources/:id/check', async (req, res, next) => {
+  const s = sources.get(Number(req.params.id));
+  if (!s) return next();
+  const r = await importer.checkSource(s);
+  res.redirect(303, `/admin/sources?msg=${encodeURIComponent(`${s.name}: ${r.message}`)}`);
+});
+router.post('/sources/:id/delete', (req, res) => {
+  sources.remove(Number(req.params.id));
+  res.redirect(303, `/admin/sources?msg=${encodeURIComponent('Source deleted.')}`);
 });
 
 // ----- Messages -----
