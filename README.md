@@ -84,6 +84,8 @@ To change categories, states or qualifications, edit `server/taxonomy.js`. Colou
 The site is one Node.js app plus one database file (`data/site.db`). **The database must live on a persistent disk**, or your posts will be lost when the server restarts.
 
 ### Option A: Render (easiest, no server to manage)
+See **[DEPLOY-RENDER.md](DEPLOY-RENDER.md)** for a detailed beginner guide using the included `render.yaml`.
+
 1. Put this folder in a GitHub repository.
 2. On render.com, create a **Web Service** from the repo. Choose **Docker** as the runtime.
 3. Add a **Disk** mounted at `/app/data` (1 GB is plenty). This keeps your posts.
